@@ -1,7 +1,7 @@
 name: Captura ANH + YPFB
 on:
   schedule:
-    - cron: '0 0 * * *'      # cada 2 horas; ajusta según tu cuota de minutos
+    cron: '0 */8 * * *'      # cada 2 horas; ajusta según tu cuota de minutos
   workflow_dispatch:
 jobs:
   capturar:
