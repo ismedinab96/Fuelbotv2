@@ -12,7 +12,8 @@ for (archivo in c("R/theme.R", "R/components.R", "R/data.R", "R/mod_resumen.R",
 ui <- page_navbar(
   title = div(class = "fb-brand",
               span(class = "fb-brand__mark", fb_icon("hoja", 18)),
-              span(class = "fb-brand__name", "FuelBot Lite")),
+              span(class = "fb-brand__name", "ChatBot FuelBot v1 DAT-253")),
+  window_title = "ChatBot FuelBot v1 DAT-253",
   id = "nav_principal",
   theme = fb_theme(),
   navbar_options = navbar_options(
