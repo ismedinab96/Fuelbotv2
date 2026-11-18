@@ -11,6 +11,7 @@ Versión de interfaz: **2.0.0**. Última validación: 2026-11-13.
 - [Instalación](#instalación)
 - [Configuración](#configuración)
 - [Ejecución](#ejecución)
+- [Despliegue gratuito y Bot de Telegram](#despliegue-gratuito-y-bot-de-telegram)
 - [Pipeline de datos](#pipeline-de-datos)
 - [Estructura del proyecto](#estructura-del-proyecto)
 - [Seguridad](#seguridad)
@@ -181,6 +182,63 @@ Resumen de las pruebas reales (detalle en [docs/CAMBIOS_TECNICOS.md](docs/CAMBIO
 - Capturas en [docs/capturas](docs/capturas).
 
 Puntaje interno del rediseño: **94,5/100**, con las limitaciones documentadas.
+
+## Despliegue gratuito y Bot de Telegram
+
+### Por qué `shinyapps.io` y no Vercel
+
+Vercel está orientado a sitios estáticos y funciones *serverless* (Node.js/Python), pero no ofrece un runtime nativo de R ni mantiene procesos persistentes WebSocket/PostgreSQL como los que necesita R Shiny (`app.R`). Para alojar el dashboard gratuitamente se utiliza **shinyapps.io** (plan Free).
+
+### Desplegar el Dashboard en `shinyapps.io`
+
+1. Crea una cuenta gratuita en [shinyapps.io](https://www.shinyapps.io/).
+2. En tu panel (*Account → Tokens → Show*), obtén tu `name`, `token` y `secret` y agrégalos a tu archivo `.Renviron` local:
+
+```text
+SHINYAPPS_ACCOUNT=tu_usuario
+SHINYAPPS_TOKEN=tu_token
+SHINYAPPS_SECRET=tu_secret
+SHINYAPPS_APP_NAME=fuelbot-lapaz
+```
+
+3. Verifica qué archivos se empaquetarán sin subir nada aún:
+
+```bash
+"C:\Program Files\R\R-4.6.1\bin\Rscript.exe" deploy_shinyapps.R --dry-run
+```
+
+4. Publica el dashboard:
+
+```bash
+"C:\Program Files\R\R-4.6.1\bin\Rscript.exe" deploy_shinyapps.R
+```
+
+El script `deploy_shinyapps.R` crea un paquete temporal con solo los archivos de la interfaz Shiny y un `.Renviron` sanitizado con **únicamente** las credenciales de solo lectura (`SUPABASE_RO_*`, `GEMINI_API_KEY` y configuración general), dejando fuera `docs/`, `data/raw/`, `sql/`, credenciales de escritura (`SUPABASE_USER`/`SUPABASE_PASSWORD`) y tokens de Telegram/shinyapps.
+
+### Bot público de Telegram en R (`telegram/bot_telegram.R`)
+
+El bot permite que cualquier usuario consulte al agente Gemini desde Telegram reutilizando directamente `agente/agente_gemini.R` (con la guardia `validar_sql()` y el rol de solo lectura `agente_ro`).
+
+1. En Telegram, abre [@BotFather](https://t.me/BotFather), envía `/newbot`, sigue los pasos y copia el token generado.
+2. Agrega la variable en tu `.Renviron` local (sin subirlo a GitHub):
+
+```text
+TELEGRAM_BOT_TOKEN=123456:ABC-tu-token-aqui
+```
+
+3. Verifica que el módulo cargue correctamente:
+
+```bash
+"C:\Program Files\R\R-4.6.1\bin\Rscript.exe" telegram/bot_telegram.R --check
+```
+
+4. Inicia el bot (modo *Long Polling*; no requiere IP pública ni HTTPS):
+
+```bash
+"C:\Program Files\R\R-4.6.1\bin\Rscript.exe" telegram/bot_telegram.R
+```
+
+Comandos disponibles dentro del chat de Telegram: `/start` o `/ayuda` (bienvenida y ejemplos), `/sql` (muestra las consultas SQL ejecutadas en la última pregunta) y `/limpiar` (reinicia el historial de la conversación). Para que el bot responda las 24 horas sin dejar tu PC encendida, puedes ejecutar `Rscript telegram/bot_telegram.R` en un contenedor gratuito (por ejemplo, Hugging Face Spaces con Docker o un VPS gratuito).
 
 ## Documentación
 

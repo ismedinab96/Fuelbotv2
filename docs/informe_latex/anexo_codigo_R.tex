@@ -1,0 +1,1666 @@
+% ============================================================
+% Anexo: codigo fuente completo de los scripts en R
+%
+% Requiere en el preambulo:
+%   \usepackage[utf8]{inputenc}
+%   \usepackage[T1]{fontenc}
+%   \usepackage{listings}
+%
+% Insertar al final del documento, despues de \appendix, para que
+% el anexo reciba la letra correspondiente. Si el documento no usa
+% \appendix, se insertara como una seccion numerada mas.
+%
+% El codigo se reproduce integramente. Solo se normalizan, para su
+% composicion tipografica, algunos caracteres decorativos de los
+% comentarios (lineas de recuadro, guiones y puntos medios) mediante
+% la opcion literate de listings. No se altera ninguna instruccion.
+% ============================================================
+
+\section{Código fuente completo de los scripts en R}
+\label{anexo:codigo-r}
+
+Este anexo reproduce el código fuente de todos los scripts en R que intervienen en el proyecto: la instalación de dependencias, el pipeline de extracción y carga, el agente basado en Gemini, la aplicación Shiny y sus módulos. Los archivos se presentan en el mismo orden en que se organizan en el repositorio. No se incluye el archivo \texttt{.Renviron}, que contiene credenciales y no forma parte del código versionado.
+
+\lstdefinestyle{anexoR}{%
+  language=R,
+  basicstyle=\ttfamily\scriptsize,
+  numbers=left,
+  numberstyle=\tiny,
+  numbersep=6pt,
+  frame=single,
+  framesep=3pt,
+  breaklines=true,
+  breakatwhitespace=false,
+  columns=fullflexible,
+  keepspaces=true,
+  showstringspaces=false,
+  tabsize=2,
+  extendedchars=true,
+  literate=%
+    {á}{{\'a}}1 {é}{{\'e}}1 {í}{{\'i}}1 {ó}{{\'o}}1 {ú}{{\'u}}1
+    {Á}{{\'A}}1 {É}{{\'E}}1 {Í}{{\'I}}1 {Ó}{{\'O}}1 {Ú}{{\'U}}1
+    {ñ}{{\~n}}1 {Ñ}{{\~N}}1 {ü}{{\"u}}1 {Ü}{{\"U}}1 {Ã}{{\~A}}1
+    {¿}{{?`}}1 {¡}{{!`}}1 {«}{{``}}1 {»}{{''}}1
+    {…}{{\ldots}}1 {—}{{---}}1 {–}{{--}}1 {−}{{-}}1 {─}{{-}}1 {·}{{$\cdot$}}1
+}
+
+\subsection{\texttt{install\_packages.R}}
+Instalación de los paquetes de R utilizados por el pipeline, el tablero y el agente.
+\begin{lstlisting}[style=anexoR]
+# Ejecutar una sola vez
+install.packages(c("httr2", "jsonlite", "dplyr", "purrr", "stringr", "tibble", "readr", "digest",
+                   "DBI", "RPostgres", "bit64", "htmltools",
+                   "shiny", "bslib", "leaflet", "plotly", "DT"))
+\end{lstlisting}
+
+\subsection{\texttt{pipeline/00\_config.R}}
+Configuración general, cliente HTTP con reintentos y límite de ritmo, copia cruda con SHA-256, utilidades de limpieza y conexiones a Supabase.
+\begin{lstlisting}[style=anexoR]
+# FuelBot Lite · Configuración y utilidades comunes (todo en R)
+suppressPackageStartupMessages({
+  library(httr2); library(jsonlite); library(dplyr); library(purrr); library(stringr)
+})
+
+`%||%` <- function(a, b) if (is.null(a) || length(a) == 0) b else a
+
+env <- function(nombre, defecto = NULL, requerido = FALSE) {
+  v <- Sys.getenv(nombre, unset = "")
+  if (!nzchar(v)) {
+    if (requerido) stop("Falta la variable de entorno ", nombre, " (revisa tu archivo .Renviron)", call. = FALSE)
+    return(defecto)
+  }
+  v
+}
+
+CFG <- list(
+  departamento_id = as.integer(env("DEPARTAMENTO_ID", "2")),            # 2 = La Paz (codificación INE usada por ANH)
+  distritos_ypfb  = trimws(strsplit(env("DISTRITOS_YPFB", "LPZ"), ",")[[1]]),
+  productos       = c(`0` = "Gasolina Especial", `1` = "Di\u00e9sel Oil", `2` = "Gasolina Premium", `3` = "Di\u00e9sel ULS"),
+  anh_base        = "https://abastecimiento.prod.anh.gob.bo/api",
+  ypfb_url        = "https://consulta.ypfb.gob.bo/",
+  user_agent      = env("USER_AGENT", "FuelBotLaPaz-Academico/1.0 (contacto: CAMBIAR@correo.com)"),
+  tz              = "America/La_Paz",
+  raw_dir         = env("RAW_DIR", "data/raw"),
+  repo_raw        = "https://raw.githubusercontent.com/sociedatos/bo-combustible/main",
+  repo_api        = "https://api.github.com/repos/sociedatos/bo-combustible/contents"
+)
+
+ahora_bo <- function() format(Sys.time(), "%Y-%m-%d %H:%M:%S", tz = CFG$tz)
+
+# ── HTTP educado: user-agent identificable, límite de ritmo y reintentos ────
+pedir <- function(url, query = list(), reintentos = 3, destino = NULL) {
+  req <- request(url) |>
+    req_user_agent(CFG$user_agent) |>
+    req_timeout(60) |>
+    req_throttle(rate = 20 / 60) |>
+    req_retry(max_tries = reintentos, backoff = function(i) 2^i)
+  if (length(query)) req <- req_url_query(req, !!!query)
+  if (is.null(destino)) resp_body_string(req_perform(req)) else { req_perform(req, path = destino); destino }
+}
+
+# ── Copia cruda comprimida + huella SHA-256 (trazabilidad) ──────────────────
+guardar_crudo <- function(texto, fuente, ext = "json") {
+  dir <- file.path(CFG$raw_dir, fuente)
+  dir.create(dir, recursive = TRUE, showWarnings = FALSE)
+  ruta <- file.path(dir, paste0(format(Sys.time(), "%Y%m%d_%H%M%S", tz = CFG$tz), ".", ext, ".gz"))
+  con <- gzfile(ruta, "w", encoding = "UTF-8"); writeLines(texto, con, useBytes = TRUE); close(con)
+  list(ruta = ruta, sha256 = digest::digest(ruta, algo = "sha256", file = TRUE))
+}
+
+# ── Utilidades de limpieza ──────────────────────────────────────────────────
+registro_a_fila <- function(x) {
+  tibble::as_tibble(lapply(x, function(v) if (is.null(v) || length(v) != 1 || is.list(v)) NA_character_ else as.character(v)))
+}
+
+# "2026-11-08T23:37:41.123Z" / "2026-11-08 23:37:41" -> "2026-11-08 23:37:41" (NA si no es válida)
+norm_fecha <- function(x) {
+  x <- as.character(x)
+  x <- sub("\\.\\d+", "", x)
+  x <- sub("(?<=\\d{2}:\\d{2}:\\d{2})(Z|[+-]\\d{2}:?\\d{2})$", "", x, perl = TRUE)
+  x <- sub("T", " ", x, fixed = TRUE)
+  x[!grepl("^\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}$", x)] <- NA_character_
+  x
+}
+
+# Repara texto UTF-8 "doble codificado" (p. ej. "AURÃ\u008dFERA" -> "AURÍFERA")
+arreglar_mojibake <- function(x) {
+  x <- as.character(x)
+  idx <- which(!is.na(x) & grepl("\u00c3", x, fixed = TRUE))
+  if (length(idx)) {
+    y <- suppressWarnings(iconv(x[idx], from = "UTF-8", to = "latin1"))
+    Encoding(y) <- "UTF-8"
+    ok <- !is.na(y) & validUTF8(y)
+    x[idx[ok]] <- y[ok]
+  }
+  x
+}
+
+# ── Conexiones a Supabase (Postgres) ────────────────────────────────────────
+conectar <- function(usuario, clave) {
+  DBI::dbConnect(RPostgres::Postgres(),
+    host = env("SUPABASE_HOST", requerido = TRUE), port = as.integer(env("SUPABASE_PORT", "5432")),
+    dbname = env("SUPABASE_DB", "postgres"), user = usuario, password = clave, sslmode = "require")
+}
+con_escritura <- function() conectar(env("SUPABASE_USER", requerido = TRUE), env("SUPABASE_PASSWORD", requerido = TRUE))
+con_lectura   <- function() conectar(env("SUPABASE_RO_USER", requerido = TRUE), env("SUPABASE_RO_PASSWORD", requerido = TRUE))
+\end{lstlisting}
+
+\subsection{\texttt{pipeline/01\_extraer\_anh.R}}
+Extracción y normalización de saldos y estaciones desde la API pública de la ANH.
+\begin{lstlisting}[style=anexoR]
+# FuelBot Lite · Extracción del portal ANH (saldo por estación y producto)
+# Equivale a update/update_abastecimiento.py del repo sociedatos/bo-combustible, pero en R y solo La Paz.
+
+COLUMNAS_SALDO <- c("fecha_actualizacion", "id_eess", "id_producto", "fecha_actualizacion_sistema", "saldo_litros",
+                    "saldo_estado", "con_venta", "fecha_ultima_venta", "despacho_en_curso", "fecha_hora_despacho", "seguimiento_id")
+COLUMNAS_ESTACION <- c("id_eess", "nombre", "direccion", "zona", "departamento_id", "lat", "lng")
+COLUMNAS_FECHA_SALDO <- c("fecha_actualizacion", "fecha_actualizacion_sistema", "fecha_ultima_venta", "fecha_hora_despacho")
+
+# Limpia y valida un data.frame de saldos (sirve para la API en vivo y para los CSV del repo)
+normalizar_saldos <- function(df, captura = NULL) {
+  adv <- character()
+  df <- df |> rename(any_of(c(id_eess = "id", id_producto = "id_producto_abs",
+                              fecha_actualizacion_sistema = "updated_at", lat = "latitud", lng = "longitud")))
+  for (c in union(COLUMNAS_SALDO, COLUMNAS_ESTACION)) if (!c %in% names(df)) df[[c]] <- NA_character_
+  df <- df |> mutate(across(everything(), as.character))
+  if (!is.null(captura)) df$fecha_actualizacion <- captura
+  if (all(is.na(df$departamento_id))) df$departamento_id <- as.character(CFG$departamento_id)
+  for (c in COLUMNAS_FECHA_SALDO) df[[c]] <- norm_fecha(df[[c]])
+
+  df <- df |> mutate(
+    id_eess = as.character(suppressWarnings(as.integer(round(as.numeric(id_eess))))),
+    id_producto = as.character(suppressWarnings(as.integer(round(as.numeric(id_producto))))),
+    departamento_id = suppressWarnings(as.integer(round(as.numeric(departamento_id)))),
+    saldo_estado = tolower(trimws(saldo_estado)),
+    nombre = arreglar_mojibake(nombre), direccion = arreglar_mojibake(direccion), zona = arreglar_mojibake(zona))
+
+  n0 <- nrow(df)
+  df <- df |> filter(!is.na(id_eess), !is.na(id_producto), !is.na(fecha_actualizacion),
+                     is.na(departamento_id) | departamento_id == CFG$departamento_id)
+  if (nrow(df) < n0) adv <- c(adv, sprintf("%d filas descartadas (sin id/fecha o de otro departamento)", n0 - nrow(df)))
+
+  raros <- setdiff(unique(na.omit(df$saldo_estado)), c("bajo", "medio", "alto"))
+  if (length(raros)) adv <- c(adv, paste("saldo_estado inesperado:", paste(raros, collapse = ", ")))
+
+  lat <- suppressWarnings(as.numeric(df$lat)); lng <- suppressWarnings(as.numeric(df$lng))
+  fuera <- !is.na(lat) & !is.na(lng) & !(lat > -23 & lat < -9 & lng > -70 & lng < -57)   # recuadro aproximado de Bolivia
+  if (any(fuera)) adv <- c(adv, sprintf("%d filas con coordenadas fuera de Bolivia (se anulan)", sum(fuera)))
+  df$lat[fuera] <- NA_character_; df$lng[fuera] <- NA_character_
+
+  df <- df[!duplicated(df[, c("fecha_actualizacion", "id_eess", "id_producto")], fromLast = TRUE), ]
+  # para estaciones, quedarse con el dato MÁS reciente de cada una
+  estaciones <- df |> arrange(desc(fecha_actualizacion)) |> distinct(id_eess, .keep_all = TRUE) |>
+    select(all_of(COLUMNAS_ESTACION)) |> mutate(departamento_id = as.character(departamento_id))
+  list(saldos = df |> select(all_of(COLUMNAS_SALDO)), estaciones = estaciones, advertencias = adv)
+}
+
+extraer_anh <- function(departamento = CFG$departamento_id, productos = as.integer(names(CFG$productos))) {
+  captura <- ahora_bo()
+  crudos <- list(); filas <- list()
+  for (p in productos) {
+    texto <- pedir(paste0(CFG$anh_base, "/estaciones"), list(departamento = departamento, producto = p))
+    js <- jsonlite::fromJSON(texto, simplifyVector = FALSE)
+    crudos[[as.character(p)]] <- js
+    if (!identical(js$strMensaje, "OK") || !is.list(js$oResultado) || length(js$oResultado) == 0) next
+    filas[[length(filas) + 1]] <- map_dfr(js$oResultado, registro_a_fila) |> mutate(id_producto = as.character(p))
+  }
+  if (!length(filas)) stop("El portal ANH no devolvió estaciones (¿cambió la API o hay bloqueo?)", call. = FALSE)
+  crudo <- guardar_crudo(jsonlite::toJSON(crudos, auto_unbox = TRUE, null = "null"), "anh")
+  res <- normalizar_saldos(bind_rows(filas), captura)
+  res$crudo <- crudo
+  res
+}
+\end{lstlisting}
+
+\subsection{\texttt{pipeline/02\_extraer\_ypfb.R}}
+Extracción del bloque JSON embebido en la página de YPFB: despachos, programación y resumen del distrito LPZ.
+\begin{lstlisting}[style=anexoR]
+# FuelBot Lite · Extracción de YPFB (despachos, programación, resumen por distrito)
+# Equivale a update/update_ypfb.py: la página trae un bloque <script id="datos-publicos"> con JSON.
+
+COL_DESP <- c("clave", "fecha_captura", "fecha_datos", "distrito_codigo", "distrito_nombre", "producto_general",
+              "producto_despachado", "familia", "cliente", "estacion", "placa_despacho", "cantidad_despachada", "unidad",
+              "fecha_despacho_programado", "fecha_despacho_efectivo", "fecha_despacho_efectivo_hora",
+              "despacho_confirmado", "ambito")
+COL_PROG <- c("clave", "fecha_captura", "fecha_datos", "distrito_codigo", "distrito_nombre", "producto_general",
+              "producto", "familia", "cliente", "volumen_programado", "canal", "atendida")
+COL_RES  <- c("fecha_captura", "fecha_datos", "distrito_codigo", "distrito_nombre", "producto_general",
+              "litros_programados", "litros_despachados", "litros_pendientes_confirmacion")
+
+completar <- function(df, cols) { for (c in cols) if (!c %in% names(df)) df[[c]] <- NA_character_; df |> mutate(across(everything(), as.character)) }
+
+# Clave estable (md5) + número de repetición para no colapsar filas idénticas legítimas
+con_clave <- function(df, campos) {
+  base <- do.call(paste, c(lapply(campos, function(c) df[[c]]), sep = "|"))
+  df$clave <- paste0(vapply(base, digest::digest, "", algo = "md5", serialize = FALSE), "-", ave(seq_along(base), base, FUN = seq_along))
+  df
+}
+
+normalizar_despachos <- function(df) {
+  df <- completar(df, setdiff(COL_DESP, "clave")) |>
+    filter(distrito_codigo %in% CFG$distritos_ypfb) |>
+    mutate(fecha_captura = norm_fecha(fecha_captura), cliente = arreglar_mojibake(cliente), estacion = arreglar_mojibake(estacion)) |>
+    filter(!is.na(fecha_captura))
+  if (!nrow(df)) return(df |> mutate(clave = character()) |> select(any_of(COL_DESP)))
+  con_clave(df, c("fecha_datos", "distrito_codigo", "placa_despacho", "fecha_despacho_efectivo_hora", "producto_despachado", "estacion", "cantidad_despachada")) |>
+    select(all_of(COL_DESP))
+}
+
+normalizar_programacion <- function(df) {
+  df <- completar(df, setdiff(COL_PROG, "clave")) |>
+    filter(distrito_codigo %in% CFG$distritos_ypfb) |>
+    mutate(fecha_captura = norm_fecha(fecha_captura), cliente = arreglar_mojibake(cliente)) |>
+    filter(!is.na(fecha_captura))
+  if (!nrow(df)) return(df |> mutate(clave = character()) |> select(any_of(COL_PROG)))
+  con_clave(df, c("fecha_datos", "distrito_codigo", "producto", "cliente", "volumen_programado")) |> select(all_of(COL_PROG))
+}
+
+normalizar_resumen <- function(df) {
+  completar(df, COL_RES) |>
+    filter(distrito_codigo %in% CFG$distritos_ypfb) |>
+    mutate(fecha_captura = norm_fecha(fecha_captura)) |>
+    filter(!is.na(fecha_captura)) |> select(all_of(COL_RES))
+}
+
+extraer_payload_ypfb <- function(html) {
+  m <- regmatches(html, regexec('<script type=["\']application/json["\'] id=["\']datos-publicos["\']>([\\s\\S]*?)</script>', html, perl = TRUE))[[1]]
+  if (length(m) < 2) stop("No encontré el bloque 'datos-publicos' en la página de YPFB (¿cambió el sitio?)", call. = FALSE)
+  jsonlite::fromJSON(m[2], simplifyVector = FALSE)
+}
+
+procesar_payload_ypfb <- function(payload, captura = ahora_bo()) {
+  distritos <- payload$distritos %||% list()
+  mapa <- setNames(distritos, vapply(distritos, function(d) as.character(d$id), ""))
+  con_meta <- function(registro, meta) registro_a_fila(modifyList(registro, meta))
+  desp <- list(); prog <- list(); res <- list()
+  for (id in names(payload$datos)) {
+    info <- mapa[[id]]; cod <- info$codigo %||% ""
+    if (!(cod %in% CFG$distritos_ypfb)) next
+    for (prod in names(payload$datos[[id]])) {
+      pd <- payload$datos[[id]][[prod]]
+      meta <- list(fecha_captura = captura, fecha_datos = payload$fecha_datos, distrito_id = id,
+                   distrito_codigo = cod, distrito_nombre = info$nombre %||% "", producto_general = prod)
+      if (!is.null(pd$resumen)) res[[length(res) + 1]] <- con_meta(pd$resumen, meta)
+      desp <- c(desp, lapply(pd$despachos %||% list(), con_meta, meta))
+      prog <- c(prog, lapply(pd$programacion %||% list(), con_meta, meta))
+    }
+  }
+  list(despachos = normalizar_despachos(bind_rows(desp)),
+       programacion = normalizar_programacion(bind_rows(prog)),
+       resumen = normalizar_resumen(bind_rows(res)))
+}
+
+extraer_ypfb <- function() {
+  html <- pedir(CFG$ypfb_url)
+  crudo <- guardar_crudo(html, "ypfb", "html")
+  out <- procesar_payload_ypfb(extraer_payload_ypfb(html))
+  out$crudo <- crudo
+  out$advertencias <- if (nrow(out$despachos) + nrow(out$programacion) == 0) "La página no trajo filas para los distritos configurados" else character()
+  out
+}
+\end{lstlisting}
+
+\subsection{\texttt{pipeline/03\_backfill\_repo.R}}
+Carga del historial semanal desde los CSV del repositorio sociedatos/bo-combustible.
+\begin{lstlisting}[style=anexoR]
+# FuelBot Lite · Historial inicial desde el repo público sociedatos/bo-combustible
+# Descarga los CSV semanales ya publicados (los actualiza su bot) y filtra solo La Paz.
+# Útil para tener datos desde el día 1 y como respaldo si el portal bloquea tu extracción directa.
+
+listar_csv_repo <- function(carpeta, origen_local = NULL) {
+  if (!is.null(origen_local)) return(list.files(file.path(origen_local, carpeta), pattern = "\\.csv$", full.names = FALSE))
+  js <- jsonlite::fromJSON(pedir(paste0(CFG$repo_api, "/", carpeta), list(ref = "main")), simplifyVector = FALSE)
+  nombres <- vapply(js, function(x) x$name, "")
+  nombres[grepl("\\.csv$", nombres)]
+}
+
+leer_csv_repo <- function(ruta, origen_local = NULL) {
+  f <- if (!is.null(origen_local)) file.path(origen_local, ruta) else pedir(paste0(CFG$repo_raw, "/", ruta), destino = tempfile(fileext = ".csv"))
+  readr::read_csv(f, col_types = readr::cols(.default = "c"), progress = FALSE, show_col_types = FALSE)
+}
+
+backfill_anh <- function(origen_local = NULL, ultimas = Inf) {
+  archivos <- listar_csv_repo("data_abastecimiento", origen_local)
+  archivos <- tail(sort(archivos), ultimas)
+  if (!length(archivos)) stop("No encontré CSV en data_abastecimiento", call. = FALSE)
+  df <- map_dfr(archivos, function(a) { message("  leyendo data_abastecimiento/", a); leer_csv_repo(paste0("data_abastecimiento/", a), origen_local) })
+  normalizar_saldos(df, captura = NULL)
+}
+
+backfill_ypfb <- function(origen_local = NULL, ultimas = Inf) {
+  leer_seccion <- function(seccion) {
+    archivos <- tail(sort(listar_csv_repo(paste0("data_ypfb/", seccion), origen_local)), ultimas)
+    map_dfr(archivos, function(a) { message("  leyendo data_ypfb/", seccion, "/", a); leer_csv_repo(paste0("data_ypfb/", seccion, "/", a), origen_local) })
+  }
+  list(despachos = normalizar_despachos(leer_seccion("despachos")),
+       programacion = normalizar_programacion(leer_seccion("programacion")),
+       resumen = normalizar_resumen(leer_seccion("resumen")),
+       advertencias = character())
+}
+\end{lstlisting}
+
+\subsection{\texttt{pipeline/04\_cargar\_supabase.R}}
+Carga idempotente en PostgreSQL mediante tabla temporal, conversión de tipos y ON CONFLICT.
+\begin{lstlisting}[style=anexoR]
+# FuelBot Lite · Carga idempotente a Supabase (Postgres): se puede repetir sin duplicar filas.
+# Estrategia: tabla temporal con todo en texto -> INSERT ... SELECT con conversión de tipos -> ON CONFLICT.
+
+TIPOS <- list(
+  estaciones = c(id_eess = "numeric::integer", nombre = "text", direccion = "text", zona = "text",
+                 departamento_id = "numeric::smallint", lat = "double precision", lng = "double precision"),
+  saldos = c(fecha_actualizacion = "timestamp", id_eess = "numeric::integer", id_producto = "numeric::smallint",
+             fecha_actualizacion_sistema = "timestamp", saldo_litros = "numeric", saldo_estado = "text", con_venta = "boolean",
+             fecha_ultima_venta = "timestamp", despacho_en_curso = "boolean", fecha_hora_despacho = "timestamp", seguimiento_id = "text"),
+  ypfb_despachos = c(clave = "text", fecha_captura = "timestamp", fecha_datos = "date", distrito_codigo = "text", distrito_nombre = "text",
+                     producto_general = "text", producto_despachado = "text", familia = "text", cliente = "text", estacion = "text",
+                     placa_despacho = "text", cantidad_despachada = "numeric", unidad = "text", fecha_despacho_programado = "date",
+                     fecha_despacho_efectivo = "date", fecha_despacho_efectivo_hora = "timestamptz", despacho_confirmado = "boolean", ambito = "text"),
+  ypfb_programacion = c(clave = "text", fecha_captura = "timestamp", fecha_datos = "date", distrito_codigo = "text", distrito_nombre = "text",
+                        producto_general = "text", producto = "text", familia = "text", cliente = "text", volumen_programado = "numeric",
+                        canal = "text", atendida = "boolean"),
+  ypfb_resumen = c(fecha_captura = "timestamp", fecha_datos = "date", distrito_codigo = "text", distrito_nombre = "text", producto_general = "text",
+                   litros_programados = "numeric", litros_despachados = "numeric", litros_pendientes_confirmacion = "numeric")
+)
+
+# SQL de carga (separado para poder probarlo): tabla temporal en texto -> INSERT ... SELECT con tipos
+sql_carga <- function(tabla, clave, actualizar = character(0), tmp = paste0("tmp_", tabla)) {
+  tipos <- TIPOS[[tabla]]; cols <- names(tipos)
+  sel <- paste0("nullif(\"", cols, "\", '')::", tipos, collapse = ", ")
+  accion <- if (length(actualizar)) paste0("do update set ", paste0(actualizar, " = excluded.", actualizar, collapse = ", ")) else "do nothing"
+  paste0("insert into fuel.", tabla, " (", paste(cols, collapse = ", "), ") select ", sel,
+         " from ", tmp, " on conflict (", paste(clave, collapse = ", "), ") ", accion)
+}
+
+cargar_tabla <- function(con, df, tabla, clave, actualizar = character(0), lote = 20000) {
+  cols <- names(TIPOS[[tabla]])
+  for (c in setdiff(cols, names(df))) df[[c]] <- NA_character_
+  df <- df[, cols, drop = FALSE]
+  df[] <- lapply(df, as.character)
+  df <- df[!duplicated(df[, clave, drop = FALSE], fromLast = TRUE), , drop = FALSE]
+  if (!nrow(df)) return(0L)
+  tmp <- paste0("tmp_", tabla)
+  sql <- sql_carga(tabla, clave, actualizar, tmp)
+  total <- 0L
+  for (idx in split(seq_len(nrow(df)), ceiling(seq_len(nrow(df)) / lote))) {
+    n <- DBI::dbWithTransaction(con, {
+      DBI::dbWriteTable(con, tmp, df[idx, , drop = FALSE], temporary = TRUE, overwrite = TRUE, row.names = FALSE)
+      k <- DBI::dbExecute(con, sql)
+      DBI::dbExecute(con, paste0("drop table if exists ", tmp))
+      k
+    })
+    total <- total + n
+  }
+  total
+}
+
+cargar_saldos <- function(con, res) {
+  est_cols <- setdiff(names(TIPOS$estaciones), "id_eess")
+  cargar_tabla(con, res$estaciones, "estaciones", "id_eess", actualizar = est_cols)
+  cargar_tabla(con, res$saldos, "saldos", c("fecha_actualizacion", "id_eess", "id_producto"))
+}
+
+cargar_ypfb <- function(con, res) {
+  n1 <- cargar_tabla(con, res$despachos, "ypfb_despachos", "clave")
+  n2 <- cargar_tabla(con, res$programacion, "ypfb_programacion", "clave", actualizar = c("fecha_captura", "atendida", "volumen_programado"))
+  n3 <- cargar_tabla(con, res$resumen, "ypfb_resumen", c("fecha_captura", "distrito_codigo", "producto_general"))
+  n1 + n2 + n3
+}
+
+registrar_log <- function(con, fuente, inicio, filas, estado, mensaje = NA_character_) {
+  DBI::dbExecute(con, "insert into fuel.ingesta_log (fuente, inicio, fin, filas, estado, mensaje) values ($1, $2, now(), $3, $4, $5)",
+                 params = list(fuente, format(inicio, "%Y-%m-%d %H:%M:%S%z"), as.integer(filas), estado, mensaje))
+}
+\end{lstlisting}
+
+\subsection{\texttt{pipeline/run\_pipeline.R}}
+Orquestador de las corridas anh, ypfb, todo y backfill.
+\begin{lstlisting}[style=anexoR]
+# FuelBot Lite · Orquestador. Uso (desde la carpeta del proyecto):
+#   Rscript pipeline/run_pipeline.R anh           # captura actual del portal ANH (solo La Paz)
+#   Rscript pipeline/run_pipeline.R ypfb          # captura actual de YPFB
+#   Rscript pipeline/run_pipeline.R todo          # anh + ypfb   (lo que corre el cron)
+#   Rscript pipeline/run_pipeline.R backfill      # historial desde el repo sociedatos/bo-combustible
+#   Rscript pipeline/run_pipeline.R backfill-local RUTA/bo-combustible   # igual, desde un clon local
+args <- commandArgs(trailingOnly = TRUE)
+modo <- if (length(args)) args[1] else "todo"
+local_dir <- if (length(args) >= 2) args[2] else NULL
+
+dir_pipeline <- "pipeline"
+for (f in c("00_config.R", "01_extraer_anh.R", "02_extraer_ypfb.R", "03_backfill_repo.R", "04_cargar_supabase.R"))
+  source(file.path(dir_pipeline, f), encoding = "UTF-8")
+
+fallos <- 0
+correr <- function(fuente, extraer, cargar) {
+  t0 <- Sys.time(); con <- con_escritura(); on.exit(DBI::dbDisconnect(con))
+  tryCatch({
+    res <- extraer()
+    for (a in res$advertencias) message("  [aviso] ", a)
+    filas <- cargar(con, res)
+    registrar_log(con, fuente, t0, filas, "ok", if (length(res$advertencias)) paste(res$advertencias, collapse = " | ") else NA_character_)
+    message(sprintf("[ok] %s: %d filas nuevas o actualizadas", fuente, filas))
+  }, error = function(e) {
+    fallos <<- fallos + 1
+    message("[ERROR] ", fuente, ": ", conditionMessage(e))
+    try(registrar_log(con, fuente, t0, 0, "error", conditionMessage(e)), silent = TRUE)
+  })
+}
+
+if (modo %in% c("anh", "todo"))  correr("anh",  extraer_anh,  cargar_saldos)
+if (modo %in% c("ypfb", "todo")) correr("ypfb", extraer_ypfb, cargar_ypfb)
+if (modo %in% c("backfill", "backfill-local")) {
+  correr("backfill_anh",  function() backfill_anh(local_dir),  cargar_saldos)
+  correr("backfill_ypfb", function() backfill_ypfb(local_dir), cargar_ypfb)
+}
+if (!modo %in% c("anh", "ypfb", "todo", "backfill", "backfill-local")) stop("Modo desconocido: ", modo)
+if (fallos > 0) quit(status = 1)
+\end{lstlisting}
+
+\subsection{\texttt{agente/agente\_gemini.R}}
+Agente Gemini con function calling, guardia validar\_sql() y ejecución con el rol de solo lectura.
+\begin{lstlisting}[style=anexoR]
+# FuelBot Lite · Agente en R con Gemini (function calling + herramienta SQL de solo lectura)
+# Es el equivalente en R del cuaderno "Agente IA SQL" (Python): mismo ciclo pregunta -> consulta SQL -> respuesta.
+# Requiere haber cargado pipeline/00_config.R (env(), pedir(), con_lectura()).
+
+MAX_FILAS  <- 50
+MAX_PASOS  <- 6
+GEMINI_API <- "https://generativelanguage.googleapis.com/v1beta"
+.fb <- new.env()   # caché: modelo elegido y conexión de solo lectura
+
+# ── Guardia SQL: primera capa. La segunda (la real) es el rol agente_ro de Postgres ───────────────
+PROHIBIDAS <- paste0("\\b(insert|update|delete|drop|alter|create|replace|grant|revoke|truncate|copy|call|execute|merge|",
+                     "vacuum|listen|notify|set|reset|do|begin|commit|rollback)\\b|pg_|information_schema|dblink|lo_import|lo_export|--|/\\*")
+
+validar_sql <- function(consulta) {
+  sql <- trimws(sub(";+\\s*$", "", trimws(consulta %||% "")))
+  if (!grepl("^(select|with)\\b", sql, ignore.case = TRUE, perl = TRUE)) return(list(error = "Solo se permiten consultas SELECT."))
+  if (grepl(";", sql, fixed = TRUE)) return(list(error = "Solo se permite una consulta por vez."))
+  if (grepl(PROHIBIDAS, sql, ignore.case = TRUE, perl = TRUE)) return(list(error = "La consulta contiene una instrucci\u00f3n no permitida."))
+  list(sql = sql)
+}
+
+filas_a_lista <- function(df) {
+  df[] <- lapply(df, function(x) {
+    if (inherits(x, "integer64")) as.numeric(x)
+    else if (inherits(x, c("POSIXt", "Date", "factor"))) as.character(x)
+    else x
+  })
+  lapply(seq_len(nrow(df)), function(i) unname(lapply(df[i, , drop = FALSE], function(v) if (length(v) == 1 && is.na(v)) NULL else v)))
+}
+
+con_ro <- function() {
+  if (is.null(.fb$con) || !DBI::dbIsValid(.fb$con)) .fb$con <- con_lectura()
+  .fb$con
+}
+
+ejecutar_sql <- function(consulta) {
+  v <- validar_sql(consulta)
+  if (!is.null(v$error)) return(v)
+  tryCatch({
+    df <- DBI::dbGetQuery(con_ro(), paste0("select * from (", v$sql, ") as q limit ", MAX_FILAS + 1))
+    list(columnas = as.list(names(df)), filas = filas_a_lista(head(df, MAX_FILAS)), recortado = nrow(df) > MAX_FILAS)
+  }, error = function(e) list(error = paste("Error de SQL:", substr(conditionMessage(e), 1, 300))))
+}
+
+# ── Gemini (API REST) ────────────────────────────────────────────────────────────────────────────
+elegir_modelo <- function() {
+  manual <- env("GEMINI_MODEL", "")
+  if (nzchar(manual)) return(manual)
+  if (!is.null(.fb$modelo)) return(.fb$modelo)
+  resp <- request(paste0(GEMINI_API, "/models")) |> req_url_query(pageSize = 200) |>
+    req_headers(`x-goog-api-key` = env("GEMINI_API_KEY", requerido = TRUE)) |> req_perform()
+  ms <- resp_body_json(resp, simplifyVector = FALSE)$models
+  nombres <- vapply(Filter(function(m) "generateContent" %in% unlist(m$supportedGenerationMethods), ms),
+                    function(m) sub("^models/", "", m$name), "")
+  preferidos <- c("gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-2.5-flash-lite")   # mismos del cuaderno del taller
+  elegido <- preferidos[preferidos %in% nombres][1]
+  if (is.na(elegido)) elegido <- grep("flash-lite", nombres, value = TRUE)[!grepl("preview", grep("flash-lite", nombres, value = TRUE))][1]
+  if (is.na(elegido)) stop("Tu clave no muestra modelos Flash-Lite. Define GEMINI_MODEL en .Renviron.", call. = FALSE)
+  .fb$modelo <- elegido
+  elegido
+}
+
+DECLARACION <- list(
+  name = "ejecutar_sql",
+  description = "Ejecuta UNA consulta SELECT de solo lectura en la base PostgreSQL de FuelBot La Paz. Devuelve columnas y hasta 50 filas.",
+  parameters = list(type = "OBJECT",
+                    properties = list(consulta = list(type = "STRING", description = "Consulta SQL SELECT en dialecto PostgreSQL")),
+                    required = list("consulta")))
+
+gemini_generar <- function(contents, sistema, modelo) {
+  body <- list(contents = contents,
+               systemInstruction = list(parts = list(list(text = sistema))),
+               tools = list(list(functionDeclarations = list(DECLARACION))),
+               generationConfig = list(temperature = 0.1))
+  resp <- request(paste0(GEMINI_API, "/models/", modelo, ":generateContent")) |>
+    req_headers(`x-goog-api-key` = env("GEMINI_API_KEY", requerido = TRUE)) |>
+    req_body_json(body, auto_unbox = TRUE, null = "null", na = "null") |>
+    req_timeout(90) |>
+    req_retry(max_tries = 3, is_transient = function(r) resp_status(r) %in% c(429, 500, 503), backoff = function(i) 15 * i) |>
+    req_error(is_error = function(r) FALSE) |>
+    req_perform()
+  if (resp_status(resp) == 429) stop("Se alcanz\u00f3 el l\u00edmite de uso gratuito de Gemini. Espera un minuto e int\u00e9ntalo de nuevo.", call. = FALSE)
+  if (resp_status(resp) >= 400) stop("Error de Gemini (", resp_status(resp), "): ", substr(resp_body_string(resp), 1, 300), call. = FALSE)
+  resp_body_json(resp, simplifyVector = FALSE)
+}
+
+SISTEMA <- paste(readLines(file.path(if (dir.exists("agente")) "agente" else ".", "instrucciones.txt"), encoding = "UTF-8"), collapse = "\n")
+
+# ── Ciclo del agente ─────────────────────────────────────────────────────────────────────────────
+# historial: lista de turnos previos list(role = "user"|"model", parts = list(list(text = ...))) (solo texto)
+# on_paso(n, consulta, resultado): callback para mostrar progreso en la interfaz
+preguntar <- function(pregunta, historial = list(), on_paso = NULL) {
+  modelo <- elegir_modelo()
+  contents <- c(historial, list(list(role = "user", parts = list(list(text = substr(pregunta, 1, 500))))))
+  pasos <- list()
+  for (i in seq_len(MAX_PASOS)) {
+    r <- gemini_generar(contents, SISTEMA, modelo)
+    cand <- if (length(r$candidates)) r$candidates[[1]] else NULL
+    if (is.null(cand$content$parts)) {
+      motivo <- cand$finishReason %||% r$promptFeedback$blockReason %||% "desconocido"
+      return(list(respuesta = paste0("El modelo no devolvi\u00f3 una respuesta (motivo: ", motivo, ")."), pasos = pasos, modelo = modelo))
+    }
+    partes <- cand$content$parts
+    llamadas <- Filter(function(p) !is.null(p$functionCall), partes)
+    if (!length(llamadas)) {
+      texto <- vapply(Filter(function(p) !is.null(p$text), partes), function(p) p$text, "")
+      return(list(respuesta = trimws(paste(texto, collapse = "\n")), pasos = pasos, modelo = modelo))
+    }
+    contents[[length(contents) + 1]] <- cand$content          # se devuelve tal cual (conserva firmas de razonamiento)
+    respuestas <- lapply(llamadas, function(p) {
+      consulta <- p$functionCall$args$consulta %||% ""
+      res <- ejecutar_sql(consulta)
+      pasos[[length(pasos) + 1]] <<- list(consulta = consulta, resultado = res)
+      if (!is.null(on_paso)) on_paso(length(pasos), consulta, res)
+      list(functionResponse = list(name = p$functionCall$name, response = res))
+    })
+    contents[[length(contents) + 1]] <- list(role = "user", parts = respuestas)
+  }
+  list(respuesta = "Alcanc\u00e9 el m\u00e1ximo de pasos sin una respuesta final. Intenta reformular la pregunta.", pasos = pasos, modelo = modelo)
+}
+\end{lstlisting}
+
+\subsection{\texttt{app.R}}
+Definición de la interfaz Shiny, el servidor, la reactividad y el refresco cada 60 segundos.
+\begin{lstlisting}[style=anexoR]
+# FuelBot Lite · Dashboard + agente (Shiny). Ejecutar con: shiny::runApp()  (desde la carpeta del proyecto)
+# La app usa SOLO el rol de lectura (agente_ro): nunca puede modificar datos.
+library(shiny); library(bslib); library(leaflet); library(plotly); library(DT)
+
+source("pipeline/00_config.R", encoding = "UTF-8")
+source("agente/agente_gemini.R", encoding = "UTF-8")
+for (archivo in c("R/theme.R", "R/components.R", "R/data.R", "R/mod_resumen.R",
+                  "R/mod_mapa.R", "R/mod_ypfb.R", "R/mod_agente.R")) {
+  source(archivo, encoding = "UTF-8")
+}
+
+ui <- page_navbar(
+  title = div(class = "fb-brand",
+              span(class = "fb-brand__mark", fb_icon("hoja", 18)),
+              span(class = "fb-brand__name", "ChatBot FuelBot v1 DAT-253")),
+  window_title = "ChatBot FuelBot v1 DAT-253",
+  id = "nav_principal",
+  theme = fb_theme(),
+  navbar_options = navbar_options(
+    bg = unname(FB$colores[["forest"]]),
+    theme = "dark",
+    collapsible = TRUE,
+    underline = FALSE
+  ),
+  header = tagList(
+    tags$head(
+      fb_fonts(),
+      tags$link(rel = "icon", type = "image/svg+xml",
+                href = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%2326382E'/%3E%3Cpath d='M44 16c-14 1-24 7-24 18 0 5 3 9 8 9 10 0 16-11 16-27Z' fill='none' stroke='%23D9DED5' stroke-width='3'/%3E%3C/svg%3E"),
+      tags$link(rel = "stylesheet", href = "motion.css?v=2.0.8"),
+      tags$script(src = "custom.js?v=2.0.8")
+    ),
+    fb_hero_ui()
+  ),
+  footer = fb_footer_ui(),
+  nav_panel("Resumen", icon = icon("chart-bar"), mod_resumen_ui("resumen")),
+  nav_panel("Mapa", icon = icon("map-marker-alt"), mod_mapa_ui("mapa")),
+  nav_panel("YPFB", icon = icon("truck"), mod_ypfb_ui("ypfb")),
+  nav_panel("Agente IA", icon = icon("robot"), mod_agente_ui("agente")),
+  fillable = FALSE
+)
+
+server <- function(input, output, session) {
+  # La interfaz se refresca solo cuando hay una captura nueva (revisa cada 60 s)
+  latido <- reactivePoll(60000, session,
+    checkFunc = function() {
+      r <- consultar("select max(fecha_captura)::text m, count(*) n from fuel.v_saldo_actual")
+      if (is.null(r)) "" else paste(r$m, r$n)
+    },
+    valueFunc = function() Sys.time()
+  )
+
+  saldo <- reactive({ latido(); consultar("select * from fuel.v_saldo_actual") })
+  desp <- reactive({
+    latido()
+    consultar("select fecha_despacho_efectivo as fecha, producto_general, sum(litros_despachados) litros from fuel.v_ypfb_despachos where despacho_confirmado group by 1,2 order by 1")
+  })
+  fuentes <- reactive({
+    latido()
+    consultar("select fuente, ultima_ingesta_ok from fuel.v_fuentes")
+  })
+
+  output$hero_meta <- renderUI({
+    d <- saldo()
+    chips <- list(
+      fb_chip("ANH · saldos por estación", "base"),
+      fb_chip("YPFB · despachos y programación", "despacho"),
+      fb_chip("Bolivia UTC−4", "reloj")
+    )
+    if (!is.null(d) && nrow(d) > 0) {
+      h <- fb_horas_captura(max(d$fecha_captura, na.rm = TRUE))
+      chips <- c(chips, list(fb_chip(fb_hace(h), "rayo", "is-live")))
+    }
+    div(class = "fb-hero__chips", chips)
+  })
+
+  output$pie_estado <- renderText({
+    f <- fuentes()
+    if (is.null(f) || nrow(f) == 0) return("Actualización: sin registro disponible")
+    texto <- vapply(seq_len(nrow(f)), function(i) {
+      x <- f$ultima_ingesta_ok[i]
+      h <- if (inherits(x, "POSIXt") && !is.na(x)) fb_horas_utc(x) else NA_real_
+      sprintf("%s: %s", f$fuente[i], fb_hace(h))
+    }, character(1))
+    paste("Actualización —", paste(texto, collapse = " · "))
+  })
+
+  mod_resumen_server("resumen", saldo, desp)
+  mod_mapa_server("mapa", saldo)
+  mod_ypfb_server("ypfb", latido)
+  mod_agente_server("agente")
+}
+
+shinyApp(ui, server)
+\end{lstlisting}
+
+\subsection{\texttt{R/theme.R}}
+Tema de bslib, paleta de colores y tipografías del tablero.
+\begin{lstlisting}[style=anexoR]
+# FuelBot Lite · Identidad visual y tema (capa de presentación)
+# Los colores viven también como variables CSS en www/motion.css.
+FB <- list(
+  version = "2.0.0",
+  colores = c(
+    forest   = "#26382E",
+    deep     = "#405A3F",
+    olive    = "#617A50",
+    leaf     = "#91A77B",
+    sage     = "#D9DED5",
+    metal    = "#A6AAA3",
+    mineral  = "#F7F8F5",
+    white    = "#FFFFFF",
+    graphite = "#26342B",
+    muted    = "#5F6B63",
+    line     = "#E3E7DF"
+  ),
+  estado = c(bajo = "#B4453C", medio = "#C58A2B", alto = "#4E7C46"),
+  estado_lbl = c(bajo = "Bajo", medio = "Medio", alto = "Alto"),
+  series = c("#405A3F", "#91A77B", "#617A50", "#C58A2B", "#A6AAA3")
+)
+
+fb_theme <- function() {
+  bslib::bs_theme(
+    version = 5,
+    primary = unname(FB$colores[["deep"]]),
+    secondary = unname(FB$colores[["olive"]]),
+    success = unname(FB$estado[["alto"]]),
+    info = unname(FB$colores[["leaf"]]),
+    warning = "#C58A2B",
+    danger = "#B4453C",
+    bg = unname(FB$colores[["mineral"]]),
+    fg = unname(FB$colores[["graphite"]]),
+    base_font = "Manrope, Inter, system-ui, -apple-system, 'Segoe UI', sans-serif",
+    heading_font = "Manrope, Inter, system-ui, -apple-system, 'Segoe UI', sans-serif"
+  )
+}
+
+fb_fonts <- function() {
+  tagList(
+    tags$link(rel = "preconnect", href = "https://fonts.googleapis.com"),
+    tags$link(rel = "preconnect", href = "https://fonts.gstatic.com", crossorigin = NA),
+    tags$link(rel = "stylesheet",
+              href = "https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap")
+  )
+}
+\end{lstlisting}
+
+\subsection{\texttt{R/components.R}}
+Componentes reutilizables de interfaz: íconos SVG, KPIs, chips, encabezado y pie.
+\begin{lstlisting}[style=anexoR]
+# FuelBot Lite · Componentes de interfaz reutilizables (sin dependencias nuevas)
+
+fb_icon <- function(nombre, tamano = 20, clase = NULL) {
+  trazo <- switch(
+    nombre,
+    estacion = '<path d="M4 21V8l8-5 8 5v13"/><path d="M3 21h18"/><path d="M9 21v-7h6v7"/><path d="M12 8v3"/>',
+    reloj = '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
+    alerta = '<path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z"/><path d="M12 9v4"/><path d="M12 17h.01"/>',
+    despacho = '<path d="M3 6h11v10H3z"/><path d="M14 9h4l3 3v4h-7z"/><circle cx="7" cy="18" r="2"/><circle cx="17" cy="18" r="2"/>',
+    mapa = '<path d="M21 10c0 7-9 12-9 12S3 17 3 10a9 9 0 0 1 18 0Z"/><circle cx="12" cy="10" r="3"/>',
+    documento = '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z"/><path d="M14 2v6h6"/><path d="M9 13h6M9 17h6"/>',
+    bot = '<rect x="4" y="7" width="16" height="12" rx="3"/><path d="M12 7V4"/><circle cx="12" cy="3" r="1.2"/><path d="M9 12h.01M15 12h.01"/><path d="M9 16h6"/>',
+    usuario = '<circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/>',
+    base = '<ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v14c0 1.7 3.6 3 8 3s8-1.3 8-3V5"/><path d="M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/>',
+    escudo = '<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10Z"/><path d="m9 12 2 2 4-4"/>',
+    hoja = '<path d="M11 20A7 7 0 0 1 9.8 6.1C15.5 5 17 4.5 19 2c1 2 2 4.2 2 8 0 5.5-4.8 10-10 10Z"/><path d="M2 21c0-3 1.9-5.4 5.1-6"/>',
+    rayo = '<path d="M13 2 3 14h9l-1 8 10-12h-9l1-8Z"/>',
+    lista = '<path d="M8 6h13M8 12h13M8 18h13"/><path d="M3 6h.01M3 12h.01M3 18h.01"/>',
+    enviar = '<path d="M22 2 11 13"/><path d="M22 2 15 22l-4-9-9-4Z"/>',
+    grafico = '<path d="M3 3v18h18"/><path d="M7 15l4-4 3 3 5-6"/>',
+    check = '<path d="m20 6-11 11-5-5"/>',
+    '<circle cx="12" cy="12" r="9"/>'
+  )
+  cls <- if (is.null(clase)) "fb-ico" else paste("fb-ico", clase)
+  htmltools::HTML(sprintf(
+    '<svg class="%s" width="%s" height="%s" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">%s</svg>',
+    cls, tamano, tamano, trazo))
+}
+
+fb_dec <- function(x, digitos = 1) {
+  ifelse(is.na(x), "s/d",
+         formatC(as.numeric(x), format = "f", digits = digitos, decimal.mark = ",", big.mark = "."))
+}
+
+fb_litros <- function(x) {
+  ifelse(is.na(x), "s/d",
+         format(round(as.numeric(x)), big.mark = ".", decimal.mark = ",",
+                scientific = FALSE, trim = TRUE))
+}
+
+fb_hace <- function(horas) {
+  ifelse(is.na(horas), "sin registro",
+         ifelse(horas < 1, "hace menos de 1 h",
+                ifelse(horas < 48, paste("hace", fb_dec(horas), "h"),
+                       paste("hace", fb_dec(horas / 24), "días"))))
+}
+
+fb_ahora_local <- function() {
+  as.POSIXct(format(Sys.time(), "%Y-%m-%d %H:%M:%S", tz = CFG$tz), tz = "UTC")
+}
+
+fb_horas_captura <- function(x) as.numeric(difftime(fb_ahora_local(), x, units = "hours"))
+fb_horas_utc <- function(x) as.numeric(difftime(Sys.time(), x, units = "hours"))
+
+fb_chip <- function(texto, icono = NULL, clase = NULL) {
+  div(class = paste(c("fb-chip", clase), collapse = " "),
+      if (!is.null(icono)) fb_icon(icono, 14),
+      span(texto))
+}
+
+fb_section <- function(kicker, titulo, descripcion = NULL, derecha = NULL) {
+  div(class = "fb-section",
+      div(class = "fb-section__text",
+          span(class = "fb-section__kicker", kicker),
+          h2(class = "fb-section__title", titulo),
+          if (!is.null(descripcion)) p(class = "fb-section__desc", descripcion)),
+      if (!is.null(derecha)) div(class = "fb-section__right", derecha))
+}
+
+fb_kpi <- function(valor_id, etiqueta, icono, tono = "oliva", nota_id = NULL) {
+  div(class = paste("fb-kpi", paste0("fb-kpi--", tono)),
+      div(class = "fb-kpi__icon", fb_icon(icono, 21)),
+      div(class = "fb-kpi__body",
+          div(class = "fb-kpi__label", etiqueta),
+          div(class = "fb-kpi__value", textOutput(valor_id, inline = TRUE)),
+          if (!is.null(nota_id)) div(class = "fb-kpi__note", textOutput(nota_id, inline = TRUE))))
+}
+
+fb_stat <- function(etiqueta, valor_id, tono = "neutro") {
+  div(class = paste("fb-stat", paste0("fb-stat--", tono)),
+      span(class = "fb-stat__label", etiqueta),
+      strong(class = "fb-stat__value", textOutput(valor_id, inline = TRUE)))
+}
+
+fb_card_title <- function(titulo, sub = NULL, derecha = NULL) {
+  div(class = "fb-card__head",
+      div(class = "fb-card__text",
+          h3(titulo),
+          if (!is.null(sub)) p(sub)),
+      if (!is.null(derecha)) div(class = "fb-card__right", derecha))
+}
+
+fb_dt_lang <- function() {
+  list(
+    search = "Buscar:",
+    lengthMenu = "Mostrar _MENU_ registros",
+    info = "Mostrando _START_ a _END_ de _TOTAL_ registros",
+    infoEmpty = "Sin registros",
+    infoFiltered = "(filtrado de _MAX_)",
+    zeroRecords = "No se encontraron registros",
+    paginate = list(first = "Primera", last = "Última", "next" = "Siguiente", previous = "Anterior")
+  )
+}
+
+fb_badge_estado <- function(x) {
+  x <- as.character(x)
+  lbl <- unname(FB$estado_lbl[x])
+  lbl[is.na(lbl)] <- "s/d"
+  cls <- ifelse(is.na(x) | !nzchar(x), "na", x)
+  sprintf('<span class="fb-badge fb-badge--%s"><i></i>%s</span>',
+          htmltools::htmlEscape(cls), htmltools::htmlEscape(lbl))
+}
+
+fb_plot_vacio <- function(mensaje) {
+  plotly::plot_ly() |>
+    plotly::layout(
+      annotations = list(list(text = mensaje, showarrow = FALSE,
+                              font = list(family = "Manrope, Inter, sans-serif", size = 13,
+                                          color = unname(FB$colores[["muted"]])))),
+      xaxis = list(visible = FALSE), yaxis = list(visible = FALSE),
+      paper_bgcolor = "rgba(0,0,0,0)", plot_bgcolor = "rgba(0,0,0,0)") |>
+    plotly::config(displayModeBar = FALSE)
+}
+
+fb_popup <- function(d) {
+  antig <- ifelse(is.na(d$antiguedad_reporte_horas), "s/d",
+                  paste0(fb_dec(d$antiguedad_reporte_horas), " h"))
+  fecha <- format(d$fecha_reporte, "%d/%m/%Y %H:%M")
+  sprintf(
+    '<div class="fb-pop"><div class="fb-pop__head"><strong>%s</strong>%s</div><div class="fb-pop__grid"><span>Dirección</span><b>%s</b><span>Producto</span><b>%s</b><span>Saldo reportado</span><b>%s L</b><span>Reportado</span><b>%s</b><span>Antigüedad</span><b>%s</b></div><div class="fb-pop__foot">Fuente: ANH · saldo reportado por la estación. No garantiza disponibilidad ni venta al público.</div></div>',
+    htmltools::htmlEscape(d$nombre), fb_badge_estado(d$saldo_estado),
+    htmltools::htmlEscape(d$direccion), htmltools::htmlEscape(d$producto),
+    fb_litros(d$saldo_litros), fecha, antig)
+}
+
+fb_hero_ui <- function() {
+  arte <- '
+  <svg viewBox="0 0 360 240" role="presentation" focusable="false">
+    <defs>
+      <linearGradient id="fbHeroGrad" x1="0" y1="0" x2="1" y2="1">
+        <stop offset="0" stop-color="#91A77B" stop-opacity=".55"/>
+        <stop offset="1" stop-color="#D9DED5" stop-opacity=".10"/>
+      </linearGradient>
+    </defs>
+    <g fill="none" stroke="url(#fbHeroGrad)" stroke-width="1.1">
+      <ellipse cx="214" cy="120" rx="112" ry="74"/>
+      <ellipse cx="214" cy="120" rx="88" ry="56"/>
+      <ellipse cx="214" cy="120" rx="62" ry="38"/>
+      <ellipse cx="214" cy="120" rx="36" ry="21"/>
+      <path d="M62 186c34-26 74-38 122-36 42 2 79 16 112 42"/>
+      <path d="M48 158c38-24 82-34 128-31 40 3 76 16 108 39"/>
+    </g>
+    <g fill="#91A77B">
+      <circle cx="128" cy="74" r="3.4"/><circle cx="302" cy="92" r="2.6"/>
+      <circle cx="268" cy="178" r="3"/><circle cx="92" cy="132" r="2.4"/>
+    </g>
+    <path d="M232 72l-26 40h18l-6 34 30-46h-19l7-28z" fill="none" stroke="#D9DED5"
+          stroke-width="1.4" stroke-linejoin="round" opacity=".8"/>
+  </svg>'
+  tags$section(class = "fb-hero", `aria-label` = "Encabezado de la plataforma",
+               div(class = "fb-hero__main",
+                   div(class = "fb-hero__brand",
+                       span(class = "fb-logo", fb_icon("hoja", 22)),
+                       span(class = "fb-hero__name", "Agente FuelBot v1 DAT-253"),
+                       span(class = "fb-hero__ver", paste0("v", FB$version))),
+                   h1(class = "fb-hero__title", "Chatbot de consultas sobre disponibilidad de combustibles"),
+                   p(class = "fb-hero__sub",
+                     "Monitoreo, análisis territorial y disponibilidad reportada de combustibles en el departamento de La Paz."),
+                   uiOutput("hero_meta")),
+               div(class = "fb-hero__art", `aria-hidden` = "true", HTML(arte)))
+}
+
+fb_footer_ui <- function() {
+  tags$footer(class = "fb-footer",
+              div(class = "fb-footer__brand",
+                  span(class = "fb-logo fb-logo--sm", fb_icon("hoja", 16)),
+                  div(strong("Agente FuelBot v1 DAT-253"),
+                      span("Elaborado para la materia DAT-253 "))),
+              div(class = "fb-footer__meta",
+                  span("Fuentes: ANH y YPFB"),
+                  span("Elaborador por: Iver Medina Balboa"),
+                  span("Zona horaria: Bolivia (UTC−4)"),
+                  span(paste0("Versión ", FB$version))),
+              div(class = "fb-footer__state", uiOutput("pie_estado")))
+}
+\end{lstlisting}
+
+\subsection{\texttt{R/data.R}}
+Conexión de solo lectura y función consultar() con reconexión.
+\begin{lstlisting}[style=anexoR]
+# FuelBot Lite · acceso de lectura compartido por la interfaz y los módulos
+# Reutiliza la conexión cacheada de agente/agente_gemini.R (rol agente_ro).
+consultar <- function(sql) {
+  intento <- function() DBI::dbGetQuery(con_ro(), sql)
+  tryCatch(intento(), error = function(e) {
+    .fb$con <- NULL
+    tryCatch(intento(), error = function(e2) NULL)
+  })
+}
+\end{lstlisting}
+
+\subsection{\texttt{R/mod\_resumen.R}}
+Módulo Resumen: KPIs, gráficos de estado y despachos, y notas metodológicas.
+\begin{lstlisting}[style=anexoR]
+# FuelBot Lite · Módulo 1: resumen ejecutivo
+
+mod_resumen_ui <- function(id) {
+  ns <- NS(id)
+  tagList(
+    fb_section(
+      "Resumen ejecutivo",
+      "Panorama de disponibilidad reportada",
+      "Indicadores calculados sobre el último reporte disponible por estación y producto. La aplicación revisa si hay una captura nueva cada 60 segundos.",
+      derecha = fb_chip("Actualización automática", "reloj")
+    ),
+    layout_columns(
+      col_widths = c(3, 3, 3, 3), gap = "1rem", fill = FALSE,
+      fb_kpi(ns("kpi_estaciones"), "Estaciones con datos", "estacion", "oliva", ns("nota_estaciones")),
+      fb_kpi(ns("kpi_captura"), "Última captura ANH", "reloj", "hoja", ns("nota_captura")),
+      fb_kpi(ns("kpi_bajo"), "Pares con saldo «bajo»", "alerta", "ambar", ns("nota_bajo")),
+      fb_kpi(ns("kpi_despacho"), "Despachado por YPFB", "despacho", "bosque", ns("nota_despacho"))
+    ),
+    layout_columns(
+      col_widths = c(6, 6), gap = "1rem", fill = FALSE,
+      card(
+        class = "fb-card fb-chart-card",
+        card_header(fb_card_title(
+          "Estado de saldo por producto",
+          "Último reporte ANH por estación · número de estaciones",
+          fb_chip("ANH", "base")
+        )),
+        plotlyOutput(ns("graf_estado"), height = "330px")
+      ),
+      card(
+        class = "fb-card fb-chart-card",
+        card_header(fb_card_title(
+          "Despachos confirmados de YPFB",
+          "Litros por día y producto · distrito comercial La Paz",
+          selectInput(ns("rango"), NULL,
+                      choices = c("7 días" = 7, "14 días" = 14, "30 días" = 30, "Todo" = 0),
+                      selected = 14, width = "132px")
+        )),
+        plotlyOutput(ns("graf_ypfb"), height = "330px")
+      )
+    ),
+    tags$section(
+      class = "fb-notes",
+      h3(fb_icon("lista", 17), "Notas metodológicas"),
+      tags$ul(
+        tags$li(HTML("<strong>Saldo reportado (ANH):</strong> inventario que declara cada estación de servicio. No equivale a disponibilidad ni a venta al público.")),
+        tags$li(HTML("<strong>Despacho confirmado (YPFB):</strong> cisterna que salió de planta hacia el distrito comercial. No implica que el producto esté disponible en una estación.")),
+        tags$li(HTML("<strong>Programación (YPFB):</strong> volumen planificado que puede no haberse atendido; se analiza por separado en la pestaña YPFB.")),
+        tags$li(HTML("Cada registro conserva fecha de reporte y fecha de captura. Fechas y horas en hora de Bolivia (UTC−4). Los estados bajo, medio y alto son los reportados por ANH; sus umbrales no se exponen en la fuente."))
+      )
+    )
+  )
+}
+
+mod_resumen_server <- function(id, saldo, desp) {
+  moduleServer(id, function(input, output, session) {
+    output$kpi_estaciones <- renderText({
+      d <- saldo()
+      if (is.null(d) || nrow(d) == 0) return("s/d")
+      format(length(unique(d$id_eess)), big.mark = ".", decimal.mark = ",")
+    })
+    output$nota_estaciones <- renderText({
+      d <- saldo()
+      if (is.null(d) || nrow(d) == 0) return("sin datos")
+      sprintf("%d productos monitoreados", length(unique(d$producto)))
+    })
+
+    output$kpi_captura <- renderText({
+      d <- saldo()
+      if (is.null(d) || nrow(d) == 0) return("s/d")
+      fb_hace(fb_horas_captura(max(d$fecha_captura, na.rm = TRUE)))
+    })
+    output$nota_captura <- renderText({
+      d <- saldo()
+      if (is.null(d) || nrow(d) == 0) return("sin datos")
+      paste("captura", format(max(d$fecha_captura, na.rm = TRUE), "%d/%m/%Y %H:%M"))
+    })
+
+    output$kpi_bajo <- renderText({
+      d <- saldo()
+      if (is.null(d) || nrow(d) == 0) return("s/d")
+      sprintf("%.0f %%", 100 * mean(d$saldo_estado == "bajo", na.rm = TRUE))
+    })
+    output$nota_bajo <- renderText({
+      d <- saldo()
+      if (is.null(d) || nrow(d) == 0) return("sin datos")
+      sprintf("de %s pares estación-producto", format(nrow(d), big.mark = ".", decimal.mark = ","))
+    })
+
+    output$kpi_despacho <- renderText({
+      d <- desp()
+      if (is.null(d) || nrow(d) == 0) return("s/d")
+      u <- max(d$fecha, na.rm = TRUE)
+      paste(fb_litros(sum(d$litros[d$fecha == u], na.rm = TRUE)), "L")
+    })
+    output$nota_despacho <- renderText({
+      d <- desp()
+      if (is.null(d) || nrow(d) == 0) return("sin datos")
+      paste("confirmado el", format(max(d$fecha, na.rm = TRUE), "%d/%m/%Y"))
+    })
+
+    output$graf_estado <- renderPlotly({
+      d <- saldo()
+      if (is.null(d) || nrow(d) == 0) return(fb_plot_vacio("Sin reportes de saldo disponibles"))
+      d$producto <- factor(d$producto, levels = unname(CFG$productos))
+      d$estado <- factor(as.character(d$saldo_estado), levels = c("bajo", "medio", "alto"))
+      t <- as.data.frame(table(producto = d$producto, estado = d$estado, useNA = "no"))
+      names(t) <- c("producto", "estado", "n")
+      t$estado_lbl <- factor(unname(FB$estado_lbl[as.character(t$estado)]),
+                             levels = unname(FB$estado_lbl))
+      plot_ly(t, x = ~n, y = ~producto, color = ~estado_lbl,
+              colors = unname(FB$estado), type = "bar", orientation = "h",
+              hovertemplate = "%{y}<br>%{fullData.name}: %{x} estaciones<extra></extra>",
+              marker = list(line = list(color = "#FFFFFF", width = 1))) |>
+        layout(
+          barmode = "stack", bargap = .38,
+          font = list(family = "Manrope, Inter, sans-serif", color = unname(FB$colores[["graphite"]]), size = 11.5),
+          paper_bgcolor = "rgba(0,0,0,0)", plot_bgcolor = "rgba(0,0,0,0)",
+          margin = list(l = 6, r = 14, t = 8, b = 6),
+          legend = list(orientation = "h", x = 0, y = 1.1, xanchor = "left", yanchor = "bottom",
+                        font = list(size = 11), title = list(text = "")),
+          xaxis = list(title = list(text = "estaciones", font = list(size = 11)),
+                       gridcolor = "#E9EDE4", zeroline = FALSE, tickfont = list(size = 11)),
+          yaxis = list(title = "", tickfont = list(size = 11.5),
+                       categoryorder = "array", categoryarray = rev(levels(t$producto))),
+          hoverlabel = list(bgcolor = "#26342B", font = list(color = "#F7F8F5", size = 11.5))
+        ) |>
+        config(displayModeBar = FALSE)
+    })
+
+    output$graf_ypfb <- renderPlotly({
+      d <- desp()
+      if (is.null(d) || nrow(d) == 0) return(fb_plot_vacio("Sin despachos confirmados disponibles"))
+      d$fecha <- as.Date(d$fecha)
+      rango <- suppressWarnings(as.integer(input$rango))
+      if (is.na(rango)) rango <- 14
+      if (rango > 0) d <- d[d$fecha >= max(d$fecha, na.rm = TRUE) - (rango - 1), , drop = FALSE]
+      d$producto_general <- factor(d$producto_general, levels = sort(unique(d$producto_general)))
+      d$litros_txt <- paste0(fb_litros(d$litros), " L")
+      tope <- max(tapply(d$litros, d$fecha, sum, na.rm = TRUE), na.rm = TRUE)
+      paso <- 1000
+      for (p in c(1000, 2000, 5000, 10000, 20000, 50000, 100000,
+                  200000, 500000, 1000000, 2000000)) {
+        if (p >= tope / 4) { paso <- p; break }
+      }
+      marcas <- seq(0, ceiling(tope / paso) * paso, by = paso)
+      dias <- as.numeric(diff(range(d$fecha))) + 1
+      paso_dias <- if (dias <= 12) 1 else if (dias <= 24) 2 else 5
+      rango_x <- range(d$fecha)
+      marcas_x <- sort(unique(d$fecha))
+      marcas_x <- marcas_x[seq(1, length(marcas_x), by = paso_dias)]
+      plot_ly(data = d) |>
+        add_bars(x = ~fecha, y = ~litros, color = ~producto_general, colors = FB$series,
+                 customdata = ~litros_txt, width = .55 * 86400000,
+                 hovertemplate = "%{x|%d/%m/%Y}<br>%{fullData.name}: %{customdata}<extra></extra>",
+                 marker = list(line = list(color = "#FFFFFF", width = .6))) |>
+        layout(
+          barmode = "stack", bargap = .32,
+          font = list(family = "Manrope, Inter, sans-serif", color = unname(FB$colores[["graphite"]]), size = 11.5),
+          paper_bgcolor = "rgba(0,0,0,0)", plot_bgcolor = "rgba(0,0,0,0)",
+          margin = list(l = 6, r = 14, t = 8, b = 6),
+          legend = list(orientation = "h", x = 0, y = 1.1, xanchor = "left", yanchor = "bottom",
+                        font = list(size = 11), title = list(text = "")),
+          xaxis = list(title = "", type = "date", tickformat = "%d/%m",
+                       tickmode = "array", tickvals = marcas_x,
+                       ticktext = format(marcas_x, "%d/%m"),
+                       range = c(rango_x[1] - 1, rango_x[2] + 1),
+                       gridcolor = "#E9EDE4", zeroline = FALSE,
+                       tickfont = list(size = 10.5), hoverformat = "%d/%m/%Y"),
+          yaxis = list(title = list(text = "litros", font = list(size = 11)),
+                       gridcolor = "#E9EDE4", zeroline = FALSE,
+                       tickmode = "array", tickvals = marcas,
+                       ticktext = format(marcas, big.mark = ".", decimal.mark = ",",
+                                         scientific = FALSE, trim = TRUE),
+                       range = c(0, max(marcas)), tickfont = list(size = 10.5)),
+          separators = ",.",
+          hoverlabel = list(bgcolor = "#26342B", font = list(color = "#F7F8F5", size = 11.5))
+        ) |>
+        config(displayModeBar = FALSE)
+    })
+  })
+}
+\end{lstlisting}
+
+\subsection{\texttt{R/mod\_mapa.R}}
+Módulo Mapa: Leaflet, filtros, tabla sincronizada y centrado.
+\begin{lstlisting}[style=anexoR]
+# FuelBot Lite · Módulo 2: mapa territorial y tabla sincronizada
+
+mod_mapa_ui <- function(id) {
+  ns <- NS(id)
+  tagList(
+    fb_section(
+      "Mapa territorial",
+      "Disponibilidad reportada por estación",
+      "Explora las estaciones del departamento de La Paz. El filtro actualiza el mapa y la tabla; los popups muestran solo campos registrados por ANH."
+    ),
+    card(
+      class = "fb-card fb-filterbar",
+      div(class = "fb-filters",
+          div(class = "fb-field",
+              selectInput(ns("producto"), "Producto", choices = unname(CFG$productos),
+                          selected = "Gasolina Especial", width = "100%")),
+          div(class = "fb-field",
+              selectInput(ns("estado"), "Estado del saldo",
+                          choices = c("Todos" = "todos", "Bajo" = "bajo",
+                                      "Medio" = "medio", "Alto" = "alto"),
+                          width = "100%")),
+          div(class = "fb-field fb-field--action",
+              actionButton(ns("centrar"), tagList(fb_icon("mapa", 16), "Centrar mapa"),
+                           class = "btn btn-outline-secondary fb-center")))
+    ),
+    div(class = "fb-stats", uiOutput(ns("stats"))),
+    card(
+      class = "fb-card fb-map-card",
+      div(class = "fb-map", leafletOutput(ns("mapa"), height = "560px"))
+    ),
+    card(
+      class = "fb-card fb-table-card",
+      card_header(fb_card_title(
+        "Estaciones visibles",
+        "Tabla sincronizada con el producto y el estado seleccionados",
+        fb_chip("ANH", "base")
+      )),
+      DTOutput(ns("tabla")),
+      div(class = "fb-table-note",
+          "Saldo reportado por la estación según ANH. Un saldo bajo no confirma desabastecimiento y un saldo alto no garantiza venta al público.")
+    )
+  )
+}
+
+mod_mapa_server <- function(id, saldo) {
+  moduleServer(id, function(input, output, session) {
+    ns <- session$ns
+
+    limites <- function(d) {
+      list(lng = range(d$lng, na.rm = TRUE), lat = range(d$lat, na.rm = TRUE))
+    }
+    encuadrar <- function(m, d) {
+      b <- limites(d)
+      fitBounds(m, b$lng[1], b$lat[1], b$lng[2], b$lat[2],
+                options = list(padding = c(24, 24)))
+    }
+
+    base <- reactive({
+      d <- saldo()
+      if (is.null(d) || nrow(d) == 0) return(NULL)
+      d <- d[d$producto == input$producto & !is.na(d$lat) & !is.na(d$lng), , drop = FALSE]
+      d
+    })
+
+    datos <- reactive({
+      d <- base()
+      if (is.null(d) || nrow(d) == 0) return(d)
+      if (!identical(input$estado, "todos")) {
+        d <- d[as.character(d$saldo_estado) == input$estado, , drop = FALSE]
+      }
+      d
+    })
+
+    agregar_marcadores <- function(m, d) {
+      col <- unname(FB$estado[as.character(d$saldo_estado)])
+      col[is.na(col)] <- unname(FB$colores[["metal"]])
+      m |>
+        addCircleMarkers(
+          data = d, lng = ~lng, lat = ~lat,
+          radius = 7, stroke = TRUE, color = "#FFFFFF", weight = 2, opacity = 1,
+          fillColor = col, fillOpacity = .92,
+          popup = fb_popup(d),
+          popupOptions = popupOptions(maxWidth = 330, closeButton = TRUE,
+                                      autoPanPadding = c(24, 24)),
+          label = ~nombre,
+          labelOptions = labelOptions(direction = "auto", textsize = "12px", opacity = .92)
+        ) |>
+        addLegend(
+          position = "bottomright", layerId = "fb_legenda",
+          colors = unname(FB$estado), labels = unname(FB$estado_lbl),
+          title = "Saldo reportado · ANH", opacity = .95
+        )
+    }
+
+    output$stats <- renderUI({
+      d <- base()
+      if (is.null(d) || nrow(d) == 0) {
+        return(div(class = "fb-stats__empty", "Sin estaciones con coordenadas para este producto."))
+      }
+      est <- as.character(d$saldo_estado)
+      stat <- function(etiqueta, valor, tono) {
+        div(class = paste("fb-stat", paste0("fb-stat--", tono)),
+            span(class = "fb-stat__label", etiqueta),
+            strong(class = "fb-stat__value", valor))
+      }
+      tagList(
+        stat("Estaciones", nrow(d), "neutro"),
+        stat("Bajo", sum(est == "bajo", na.rm = TRUE), "bajo"),
+        stat("Medio", sum(est == "medio", na.rm = TRUE), "medio"),
+        stat("Alto", sum(est == "alto", na.rm = TRUE), "alto")
+      )    })
+
+    output$mapa <- renderLeaflet({
+      d <- isolate(datos())
+      m <- leaflet() |>
+        addProviderTiles(providers$OpenStreetMap, group = "osm") |>
+        addScaleBar(position = "bottomleft")
+      if (is.null(d) || nrow(d) == 0) {
+        m <- m |> setView(-68.15, -16.5, 9)
+      } else {
+        m <- encuadrar(m, d) |>
+          agregar_marcadores(d)
+      }
+      m
+    })
+
+    observeEvent(datos(), {
+      d <- datos()
+      proxy <- leafletProxy(ns("mapa"))
+      proxy <- proxy |> clearMarkers() |> removeControl("fb_legenda")
+      if (!is.null(d) && nrow(d) > 0) proxy <- agregar_marcadores(proxy, d)
+    }, ignoreInit = TRUE)
+
+    observeEvent(input$producto, {
+      d <- datos()
+      if (!is.null(d) && nrow(d) > 0) {
+        encuadrar(leafletProxy(ns("mapa")), d)
+      }
+    }, ignoreInit = TRUE)
+
+    observeEvent(input$centrar, {
+      d <- datos()
+      if (!is.null(d) && nrow(d) > 0) {
+        encuadrar(leafletProxy(ns("mapa")), d)
+      } else {
+        leafletProxy(ns("mapa")) |> setView(-68.15, -16.5, 9)
+      }
+    })
+
+    output$tabla <- renderDT({
+      d <- datos()
+      if (is.null(d) || nrow(d) == 0) {
+        vacia <- data.frame(Estacion = character(), Direccion = character(), Saldo = numeric(),
+                            Estado = character(), Reportado = character(), Antiguedad = numeric(),
+                            stringsAsFactors = FALSE)
+        return(datatable(vacia, rownames = FALSE, colnames = c("Estación", "Dirección", "Saldo (L)",
+                                                              "Estado", "Reportado", "Antigüedad (h)"),
+                         options = list(pageLength = 8, language = fb_dt_lang(),
+                                        searching = FALSE, paging = FALSE, info = FALSE)))
+      }
+      tab <- data.frame(
+        Estacion = htmltools::htmlEscape(d$nombre),
+        Direccion = htmltools::htmlEscape(d$direccion),
+        Saldo = as.numeric(d$saldo_litros),
+        Estado = fb_badge_estado(d$saldo_estado),
+        Reportado = format(d$fecha_reporte, "%Y-%m-%d %H:%M"),
+        Antiguedad = as.numeric(d$antiguedad_reporte_horas),
+        stringsAsFactors = FALSE
+      )
+      datatable(
+        tab, escape = FALSE, rownames = FALSE, class = "display fb-dt",
+        colnames = c("Estación", "Dirección", "Saldo (L)", "Estado", "Reportado", "Antigüedad (h)"),
+        options = list(
+          pageLength = 8, lengthMenu = c(8, 15, 25, 50), autoWidth = FALSE,
+          order = list(list(2, "desc")),
+          columnDefs = list(list(className = "dt-right", targets = c(2, 5))),
+          language = fb_dt_lang()
+        )
+      ) |>
+        formatCurrency(columns = 3, currency = "", interval = 3, mark = ".", dec.mark = ",", digits = 0) |>
+        formatRound(columns = 6, digits = 1, dec.mark = ",")
+    })
+  })
+}
+\end{lstlisting}
+
+\subsection{\texttt{R/mod\_ypfb.R}}
+Módulo YPFB: despachos, programación y tabla filtrable.
+\begin{lstlisting}[style=anexoR]
+# FuelBot Lite · Módulo 3: programación y despachos de YPFB
+
+mod_ypfb_ui <- function(id) {
+  ns <- NS(id)
+  tagList(
+    fb_section(
+      "YPFB · Distrito comercial La Paz",
+      "Programación y despachos",
+      "Volúmenes planificados que aún no fueron atendidos y despachos confirmados desde planta. Son dos tipos de dato distintos y no deben sumarse entre sí."
+    ),
+    layout_columns(
+      col_widths = c(4, 4, 4), gap = "1rem", fill = FALSE,
+      fb_kpi(ns("kpi_prog"), "Programado pendiente", "documento", "oliva", ns("nota_prog")),
+      fb_kpi(ns("kpi_desp"), "Despachado confirmado", "despacho", "bosque", ns("nota_desp")),
+      fb_kpi(ns("kpi_fecha"), "Última fecha de datos", "reloj", "hoja", ns("nota_fecha"))
+    ),
+    card(
+      class = "fb-card fb-table-card",
+      card_header(fb_card_title(
+        "Programación pendiente",
+        "Registros no atendidos del último día con datos de YPFB",
+        fb_chip("YPFB", "despacho")
+      )),
+      div(class = "fb-table-toolbar",
+          selectInput(ns("producto"), "Filtrar por producto",
+                      choices = c("Todos los productos" = "__todos__"), width = "280px")),
+      DTOutput(ns("tabla_prog")),
+      div(class = "fb-table-note",
+          "La programación es un volumen planificado. No equivale a despacho confirmado ni a disponibilidad en la estación.")
+    )
+  )
+}
+
+mod_ypfb_server <- function(id, latido) {
+  moduleServer(id, function(input, output, session) {
+    ns <- session$ns
+
+    prog <- reactive({
+      latido()
+      consultar("select producto, cliente, litros_programados, fecha_datos from fuel.v_ypfb_programacion where not atendida and fecha_datos = (select max(fecha_datos) from fuel.v_ypfb_programacion) order by litros_programados desc")
+    })
+
+    desp_dia <- reactive({
+      latido()
+      consultar("select max(fecha_despacho_efectivo) as fecha, sum(litros_despachados) as litros, count(*) as n from fuel.v_ypfb_despachos where despacho_confirmado and fecha_despacho_efectivo = (select max(fecha_despacho_efectivo) from fuel.v_ypfb_despachos where despacho_confirmado)")
+    })
+
+    output$kpi_prog <- renderText({
+      d <- prog()
+      if (is.null(d) || nrow(d) == 0) return("s/d")
+      paste(fb_litros(sum(d$litros_programados, na.rm = TRUE)), "L")
+    })
+    output$nota_prog <- renderText({
+      d <- prog()
+      if (is.null(d) || nrow(d) == 0) return("sin registros pendientes")
+      sprintf("%s registros · %d clientes",
+              format(nrow(d), big.mark = ".", decimal.mark = ","), length(unique(d$cliente)))
+    })
+
+    output$kpi_desp <- renderText({
+      d <- desp_dia()
+      if (is.null(d) || nrow(d) == 0 || is.na(d$litros[1])) return("s/d")
+      paste(fb_litros(d$litros[1]), "L")
+    })
+    output$nota_desp <- renderText({
+      d <- desp_dia()
+      if (is.null(d) || nrow(d) == 0 || is.na(d$litros[1])) return("sin despachos confirmados")
+      sprintf("%s despachos · %s", format(d$n[1], big.mark = ".", decimal.mark = ","),
+              format(as.Date(d$fecha[1]), "%d/%m/%Y"))
+    })
+
+    output$kpi_fecha <- renderText({
+      d <- prog()
+      if (is.null(d) || nrow(d) == 0) return("s/d")
+      format(max(d$fecha_datos, na.rm = TRUE), "%d/%m/%Y")
+    })
+    output$nota_fecha <- renderText({
+      d <- prog()
+      if (is.null(d) || nrow(d) == 0) return("sin fecha disponible")
+      "fecha de datos YPFB"
+    })
+
+    observeEvent(prog(), {
+      d <- prog()
+      ops <- if (is.null(d) || nrow(d) == 0) character() else sort(unique(d$producto))
+      sel <- isolate(input$producto %||% "__todos__")
+      if (!identical(sel, "__todos__") && !(sel %in% ops)) sel <- "__todos__"
+      updateSelectInput(session, "producto",
+                        choices = c("Todos los productos" = "__todos__",
+                                    stats::setNames(ops, ops)),
+                        selected = sel)
+    })
+
+    filtrada <- reactive({
+      d <- prog()
+      if (is.null(d) || nrow(d) == 0) return(NULL)
+      sel <- input$producto %||% "__todos__"
+      if (!identical(sel, "__todos__") && nzchar(sel)) d <- d[d$producto == sel, , drop = FALSE]
+      d
+    })
+
+    output$tabla_prog <- renderDT({
+      d <- filtrada()
+      if (is.null(d) || nrow(d) == 0) {
+        vacia <- data.frame(Producto = character(), Cliente = character(),
+                            Litros = numeric(), Fecha = character(), stringsAsFactors = FALSE)
+        return(datatable(vacia, rownames = FALSE,
+                         colnames = c("Producto", "Cliente", "Litros", "Fecha de datos"),
+                         options = list(pageLength = 10, language = fb_dt_lang(),
+                                        searching = FALSE, paging = FALSE, info = FALSE)))
+      }
+      tab <- data.frame(
+        Producto = d$producto,
+        Cliente = d$cliente,
+        Litros = as.numeric(d$litros_programados),
+        Fecha = format(as.Date(d$fecha_datos), "%d/%m/%Y"),
+        stringsAsFactors = FALSE
+      )
+      datatable(
+        tab, rownames = FALSE, class = "display fb-dt",
+        colnames = c("Producto", "Cliente", "Litros", "Fecha de datos"),
+        options = list(
+          pageLength = 10, lengthMenu = c(10, 25, 50, 100), autoWidth = FALSE,
+          order = list(list(2, "desc")),
+          columnDefs = list(
+            list(className = "dt-right", targets = c(2, 3)),
+            list(width = "120px", targets = 2),
+            list(width = "130px", targets = 3)
+          ),
+          language = fb_dt_lang()
+        )
+      ) |>
+        formatCurrency(columns = 3, currency = "", interval = 3, mark = ".", dec.mark = ",", digits = 0)
+    })
+  })
+}
+\end{lstlisting}
+
+\subsection{\texttt{R/mod\_agente.R}}
+Módulo Agente IA: chat, cuotas, historial y visualización de la evidencia SQL.
+\begin{lstlisting}[style=anexoR]
+# FuelBot Lite · Módulo 4: agente conversacional Gemini
+
+mod_agente_ui <- function(id) {
+  ns <- NS(id)
+  tagList(
+    fb_section(
+      "Asistente analítico",
+      "Agente FuelBot AI",
+      "Consultas en lenguaje natural sobre las vistas de ANH y YPFB. El agente trabaja con SQL de solo lectura y muestra la evidencia de cada respuesta."
+    ),
+    layout_columns(
+      col_widths = c(8, 4), gap = "1rem", fill = FALSE,
+      card(
+        class = "fb-card fb-chat",
+        div(class = "fb-chat__head",
+            div(class = "fb-chat__avatar", fb_icon("bot", 22)),
+            div(class = "fb-chat__id",
+                h2("FuelBot AI"),
+                div(class = "fb-chat__sub", uiOutput(ns("modelo"), inline = TRUE))),
+            uiOutput(ns("estado"), inline = TRUE)),
+        div(class = "fb-chat__scroll",
+            uiOutput(ns("chat")),
+            div(id = ns("pensando"), class = "typing hidden",
+                span(), span(), span(),
+                tags$em("consulta la base y redacta la respuesta…"))),
+        div(class = "fb-chat__composer",
+            textAreaInput(ns("pregunta"), NULL, rows = 2, width = "100%",
+                          placeholder = "Ej.: ¿Qué estaciones de El Alto reportan saldo alto de diésel?"),
+            div(class = "fb-chat__actions",
+                span(class = "fb-hint", "Ctrl + Enter para enviar"),
+                actionButton(ns("enviar"), tagList(fb_icon("enviar", 16), "Enviar"),
+                             class = "btn btn-primary fb-send"))),
+        div(class = "fb-chat__legal",
+            "El agente puede equivocarse. Revisa la fuente, las fechas y las consultas SQL desplegables antes de usar una cifra.")
+      ),
+      div(class = "fb-chat-side",
+          div(class = "fb-side-card",
+              h3("Qué puedes consultar"),
+              tags$ul(class = "fb-side-list",
+                      tags$li(fb_icon("estacion", 15), span("Saldos reportados por estación y producto (ANH).")),
+                      tags$li(fb_icon("despacho", 15), span("Despachos confirmados y programación (YPFB).")),
+                      tags$li(fb_icon("base", 15), span("Cobertura temporal y fuentes registradas.")),
+                      tags$li(fb_icon("grafico", 15), span("Conteos, promedios y comparaciones con evidencia SQL."))),
+              div(class = "fb-ejemplos",
+                  actionButton(ns("ej1"), "¿Cuántas estaciones reportan saldo alto de gasolina especial?",
+                               class = "fb-ejemplo"),
+                  actionButton(ns("ej2"), "¿Qué estaciones de El Alto reportan saldo bajo de diésel?",
+                               class = "fb-ejemplo"),
+                  actionButton(ns("ej3"), "¿Cuántos litros despachó YPFB el último día?",
+                               class = "fb-ejemplo"))),
+          div(class = "fb-side-card",
+              h3("Límites y seguridad"),
+              tags$ul(class = "fb-side-list",
+                      tags$li(fb_icon("escudo", 15), span("Solo lectura: el rol de base de datos no puede modificar información.")),
+                      tags$li(fb_icon("base", 15), span("Máximo 50 filas por consulta y 6 pasos por pregunta.")),
+                      tags$li(fb_icon("alerta", 15), span("Un saldo reportado no garantiza disponibilidad física de combustible.")),
+                      tags$li(fb_icon("reloj", 15), span("Fechas y horas en hora de Bolivia (UTC−4).")))),
+          div(class = "fb-side-card", uiOutput(ns("cuota")))
+      )
+    )
+  )
+}
+
+mod_agente_server <- function(id) {
+  moduleServer(id, function(input, output, session) {
+    chat <- reactiveVal(list())
+    uso <- reactiveValues(marcas = numeric(), total = 0)
+    estado <- reactiveVal("listo")
+    modelo <- reactiveVal(Sys.getenv("GEMINI_MODEL", ""))
+
+    historial <- function(msgs) {
+      msgs <- tail(msgs, 6)
+      lapply(msgs, function(m) {
+        list(role = if (m$rol == "user") "user" else "model",
+             parts = list(list(text = m$texto)))
+      })
+    }
+
+    output$modelo <- renderText({
+      m <- modelo()
+      if (nzchar(m)) paste("Gemini ·", m) else "Gemini · selección automática"
+    })
+
+    output$estado <- renderUI({
+      e <- estado()
+      cls <- switch(e, procesando = "is-busy", error = "is-error", "is-ready")
+      lbl <- switch(e, procesando = "Procesando…", error = "Revisar error", "Listo")
+      span(class = paste("fb-status", cls), span(class = "fb-status__dot"), lbl)
+    })
+
+    output$cuota <- renderUI({
+      pct <- min(100, round(100 * uso$total / 30))
+      div(class = "fb-quota",
+          div(class = "fb-quota__top",
+              span("Consultas en esta sesión"),
+              strong(sprintf("%d / 30", uso$total))),
+          div(class = "fb-quota__bar",
+              div(class = "fb-quota__fill", style = sprintf("width:%d%%", pct))),
+          p(class = "fb-quota__hint", "Máximo 3 preguntas por minuto."))
+    })
+
+    rellenar <- function(texto) {
+      updateTextAreaInput(session, "pregunta", value = texto)
+    }
+    observeEvent(input$ej1, rellenar("¿Cuántas estaciones reportan saldo alto de gasolina especial?"), ignoreInit = TRUE)
+    observeEvent(input$ej2, rellenar("¿Qué estaciones de El Alto reportan saldo bajo de diésel?"), ignoreInit = TRUE)
+    observeEvent(input$ej3, rellenar("¿Cuántos litros despachó YPFB el último día?"), ignoreInit = TRUE)
+
+    observeEvent(input$enviar, {
+      q <- trimws(input$pregunta)
+      if (!nzchar(q)) {
+        session$sendCustomMessage("fb_fin", TRUE)
+        return()
+      }
+
+      ahora <- as.numeric(Sys.time())
+      uso$marcas <- c(uso$marcas[uso$marcas > ahora - 60], ahora)
+      if (length(uso$marcas) > 3 || uso$total >= 30) {
+        showNotification(
+          "Límite de cuota: máximo 3 preguntas por minuto y 30 por sesión. Espera un momento.",
+          type = "warning", duration = 6
+        )
+        session$sendCustomMessage("fb_fin", TRUE)
+        return()
+      }
+      uso$total <- uso$total + 1
+      estado("procesando")
+
+      res <- withProgress(message = "El agente está trabajando…", value = 0.1, {
+        tryCatch(
+          preguntar(q, historial(chat()), on_paso = function(n, sql, r) {
+            setProgress(value = min(0.9, 0.1 + 0.2 * n),
+                        detail = paste0("Consulta ", n,
+                                        if (!is.null(r$error)) " con error" else " ejecutada"))
+          }),
+          error = function(e) {
+            list(respuesta = paste("No pude responder:", conditionMessage(e)),
+                 pasos = list(), modelo = "", error = TRUE)
+          }
+        )
+      })
+
+      hora <- format(Sys.time(), "%H:%M", tz = CFG$tz)
+      chat(c(
+        chat(),
+        list(list(rol = "user", texto = q, hora = hora)),
+        list(list(rol = "model", texto = res$respuesta %||% "Sin respuesta.",
+                  pasos = res$pasos %||% list(), hora = hora,
+                  modelo = res$modelo %||% "", error = isTRUE(res$error)))
+      ))
+      if (nzchar(res$modelo %||% "")) modelo(res$modelo)
+      estado(if (isTRUE(res$error)) "error" else "listo")
+      updateTextAreaInput(session, "pregunta", value = "")
+      session$sendCustomMessage("fb_fin", TRUE)
+      session$sendCustomMessage("fb_scroll", TRUE)
+    }, ignoreInit = TRUE)
+
+    output$chat <- renderUI({
+      msgs <- chat()
+      if (!length(msgs)) {
+        return(div(class = "fb-chat__empty",
+                   div(class = "fb-chat__empty-icon", fb_icon("bot", 26)),
+                   h3("Pregunta sobre los datos registrados"),
+                   p("El asistente consulta las vistas de ANH y YPFB en modo solo lectura. Cada respuesta incluye fuente y fechas, y las consultas SQL quedan disponibles como evidencia.")))
+      }
+      tagList(lapply(msgs, function(m) {
+        if (m$rol == "user") {
+          div(class = "fb-msg fb-msg--user",
+              div(class = "fb-msg__content",
+                  div(class = "fb-msg__meta", span("Tú"), span(m$hora)),
+                  div(class = "fb-msg__bubble", m$texto)))
+        } else {
+          pasos <- m$pasos
+          div(class = "fb-msg fb-msg--bot",
+              div(class = "fb-msg__avatar", fb_icon("bot", 17)),
+              div(class = "fb-msg__content",
+                  div(class = "fb-msg__meta",
+                      span("FuelBot AI"), span(m$hora),
+                      if (nzchar(m$modelo)) span(class = "fb-msg__model", m$modelo)),
+                  div(class = paste("fb-msg__bubble", if (isTRUE(m$error)) "is-error"),
+                      HTML(shiny::markdown(htmltools::htmlEscape(m$texto)))),
+                  if (length(pasos)) {
+                    tags$details(
+                      class = "fb-sql",
+                      tags$summary(fb_icon("base", 14),
+                                   sprintf("Consultas SQL ejecutadas (%d)", length(pasos))),
+                      lapply(seq_along(pasos), function(i) {
+                        p <- pasos[[i]]
+                        r <- p$resultado
+                        err <- !is.null(r$error)
+                        resumen <- if (err) "error" else {
+                          paste0(length(r$filas), " filas", if (isTRUE(r$recortado)) " · recortado a 50" else "")
+                        }
+                        div(class = "fb-sql__step",
+                            div(class = "fb-sql__head",
+                                span(class = "fb-sql__n", paste0("Consulta ", i)),
+                                span(class = paste("fb-sql__res", if (err) "is-error"),
+                                     resumen)),
+                            tags$pre(class = "fb-sql__code", p$consulta),
+                            if (err) div(class = "fb-sql__error", r$error))
+                      })
+                    )
+                  })
+          )
+        }
+      }))
+    })
+  })
+}
+\end{lstlisting}
